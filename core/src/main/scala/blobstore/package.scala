@@ -15,33 +15,19 @@ Copyright 2018 LendUp Global, Inc.
  */
 
 import blobstore.url.{Authority, FsObject, Path, Url}
-
-import java.io.OutputStream
-import java.nio.file.Files
-import cats.effect.{Blocker, Concurrent, ContextShift, Resource, Sync}
-import fs2.{Chunk, Hotswap, Pipe, Pull, RaiseThrowable, Stream}
+import cats.effect.std.Hotswap
+import cats.effect.{Concurrent, MonadCancelThrow, Resource}
+import fs2.{Chunk, Pipe, Pull, RaiseThrowable, Stream}
+import fs2.io.file.Files
 import cats.implicits._
 
 package object blobstore {
-  protected[blobstore] def _writeAllToOutputStream1[F[_]](in: Stream[F, Byte], out: OutputStream, blocker: Blocker)(
-    implicit F: Sync[F],
-    CS: ContextShift[F]
-  ): Pull[F, Nothing, Unit] = {
-    in.pull.uncons.flatMap {
-      case None => Pull.done
-      case Some((hd, tl)) =>
-        Pull.eval[F, Unit](blocker.delay(out.write(hd.toArray))) >> _writeAllToOutputStream1(tl, out, blocker)
-    }
-  }
 
-  protected[blobstore] def bufferToDisk[F[_]](
-    chunkSize: Int,
-    blocker: Blocker
-  )(implicit F: Sync[F], CS: ContextShift[F]): Pipe[F, Byte, (Long, Stream[F, Byte])] = { in =>
-    Stream.bracket(F.delay(Files.createTempFile("bufferToDisk", ".bin")))(p => F.delay(p.toFile.delete).void).flatMap {
-      p =>
-        in.through(fs2.io.file.writeAll(p, blocker)).drain ++
-          Stream.emit((p.toFile.length, fs2.io.file.readAll(p, blocker, chunkSize)))
+  protected[blobstore] def bufferToDisk[F[_]: MonadCancelThrow](
+    chunkSize: Int
+  )(implicit files: Files[F]): Pipe[F, Byte, (Long, Stream[F, Byte])] = { in =>
+    Stream.resource(Files[F].tempFile(prefix = "bufferToDisk")).flatMap { p =>
+      in.through(files.writeAll(p)).drain ++ Stream.emit((p.toFile.length, files.readAll(p, chunkSize)))
     }
   }
 
@@ -89,7 +75,7 @@ package object blobstore {
     }
   }
 
-  private[blobstore] def defaultTransferTo[F[_]: Sync, A <: Authority, B, P, C](
+  private[blobstore] def defaultTransferTo[F[_]: Concurrent, A <: Authority, B, P, C](
     selfStore: PathStore[F, C],
     dstStore: Store[F, A, B],
     srcPath: Path[P],

@@ -20,10 +20,9 @@ import java.nio.file.{Path => NioPath}
 
 import blobstore.fs.FileStore
 import blobstore.url.{Authority, FsObject, Path, Url}
-import cats.effect.concurrent.Ref
 import org.scalatest.{BeforeAndAfterAll, Inside}
 import cats.effect.IO
-import cats.effect.laws.util.TestInstances
+import cats.effect.unsafe.implicits.global
 import cats.implicits._
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.must.Matchers
@@ -36,9 +35,7 @@ abstract class AbstractStoreTest[A <: Authority, B <: FsObject]
   extends AnyFlatSpec
   with Matchers
   with BeforeAndAfterAll
-  with TestInstances
-  with Inside
-  with IOTest {
+  with Inside {
 
   // Override this
   def mkStore(): Store[IO, A, B]
@@ -48,7 +45,7 @@ abstract class AbstractStoreTest[A <: Authority, B <: FsObject]
   val testRun: UUID = java.util.UUID.randomUUID()
 
   val transferStoreRootDir: Path.Plain = Path(s"tmp/transfer-store-root/$testRun")
-  val transferStore: FileStore[IO]     = new FileStore[IO](blocker)
+  val transferStore: FileStore[IO]     = FileStore[IO]
 
   // This path used for testing root level listing. Can be overridden by tests for stores that doesn't allow access
   // to the real root. No writing is done to this path.
@@ -470,7 +467,7 @@ abstract class AbstractStoreTest[A <: Authority, B <: FsObject]
     writeFile(store, dir.path)("3")
 
     val test = for {
-      counter <- Ref.of[IO, Int](0)
+      counter <- IO.ref(0)
       _ <- data
         .through(store.putRotate(counter.getAndUpdate(_ + 1).map(i => dir / s"$i"), fileLength.toLong))
         .compile
@@ -503,7 +500,7 @@ abstract class AbstractStoreTest[A <: Authority, B <: FsObject]
 
   def writeFile(store: Store[IO, A, B], tmpDir: Path.Plain)(filename: String): Url[A] = {
     def retry[AA](io: IO[AA], count: Int, times: Int): IO[AA] = io.handleErrorWith { t =>
-      if (count < times) timer.sleep(500.millis) >> retry(io, count + 1, times) else IO.raiseError(t)
+      if (count < times) IO.sleep(500.millis) >> retry(io, count + 1, times) else IO.raiseError(t)
     }
     val url = Url(scheme, authority, tmpDir / filename)
 

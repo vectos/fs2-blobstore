@@ -16,14 +16,14 @@ Copyright 2018 LendUp Global, Inc.
 package blobstore
 
 import java.nio.charset.StandardCharsets
-
 import blobstore.url.{Authority, Path, Url}
 import blobstore.url.Authority.Bucket
 import blobstore.url.exception.MultipleUrlValidationException
 import cats.{ApplicativeError, MonadError}
 import cats.data.Validated
-import cats.effect.{ContextShift, Sync}
+import cats.effect.kernel.Concurrent
 import cats.syntax.all._
+import fs2.io.file.Files
 import fs2.{Pipe, Stream}
 
 import scala.util.{Failure, Success, Try}
@@ -113,7 +113,7 @@ trait Store[F[_], A <: Authority, +BlobType] {
 }
 
 object Store {
-  implicit def syntax[F[_]: Sync: ContextShift, A <: Authority, B](store: Store[F, A, B]): StoreOps[F, A, B] =
+  implicit def syntax[F[_]: Files: Concurrent, A <: Authority, B](store: Store[F, A, B]): StoreOps[F, A, B] =
     new StoreOps[F, A, B](store)
 
   /** Blobstores operates on buckets and returns store specific blob types

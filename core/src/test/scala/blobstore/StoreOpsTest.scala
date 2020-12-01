@@ -1,25 +1,20 @@
 package blobstore
 
 import java.nio.charset.{Charset, StandardCharsets}
-import java.nio.file.Files
-import java.util.concurrent.Executors
-
+import java.nio.file.{Files => JFiles}
 import blobstore.url.{Authority, Path, Url}
 import blobstore.url.Authority.Bucket
-import cats.effect.{Blocker, ContextShift, IO}
-import cats.effect.laws.util.TestInstances
+import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 import cats.MonadError
+import fs2.io.file.Files
 import fs2.{Pipe, Stream}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.must.Matchers
 
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.ExecutionContext
 
-class StoreOpsTest extends AnyFlatSpec with Matchers with TestInstances {
-
-  implicit val cs = IO.contextShift(ExecutionContext.global)
-  val blocker     = Blocker.liftExecutionContext(ExecutionContext.fromExecutor(Executors.newCachedThreadPool))
+class StoreOpsTest extends AnyFlatSpec with Matchers {
 
   behavior of "PutOps"
   it should "buffer contents and compute size before calling Store.put" in {
@@ -29,7 +24,11 @@ class StoreOpsTest extends AnyFlatSpec with Matchers with TestInstances {
     Stream
       .emits(bytes)
       .covary[IO]
-      .through(store.bufferedPut(Url.unsafe[Bucket]("foo://bucket/path/to/file.txt"), true, 4096, blocker))
+      .through(store.bufferedPut(
+        Url.unsafe[Bucket]("foo://bucket/path/to/file.txt"),
+        overwrite = true,
+        chunkSize = 4096
+      ))
       .compile
       .drain
       .unsafeRunSync()
@@ -40,14 +39,10 @@ class StoreOpsTest extends AnyFlatSpec with Matchers with TestInstances {
   it should "upload a file from a nio Path" in {
     val bytes = "hello".getBytes(Charset.forName("utf-8"))
     val store = DummyStore()
-
-    Stream
-      .bracket(IO(Files.createTempFile("test-file", ".bin"))) { p => IO(p.toFile.delete).void }
-      .flatMap { p =>
-        Stream.emits(bytes).covary[IO].through(fs2.io.file.writeAll(p, blocker)).drain ++
-          Stream.eval(store.put(p, Url.unsafe[Bucket]("foo://bucket/path/to/file.txt"), true, blocker))
-      }
-      .compile
+    Stream.resource(Files[IO].tempFile(prefix = "test-file", suffix = ".bin")).flatMap { p =>
+      Stream.emits(bytes).covary[IO].through(Files[IO].writeAll(p)).drain ++
+        Stream.eval(store.put(p, Url.unsafe[Bucket]("foo://bucket/path/to/file.txt"), true))
+    }.compile
       .drain
       .unsafeRunSync()
     store.buf.toArray must be(bytes)
@@ -60,11 +55,11 @@ class StoreOpsTest extends AnyFlatSpec with Matchers with TestInstances {
     Stream.emits(bytes).through(store.put(path)).compile.drain.unsafeRunSync()
 
     Stream
-      .bracket(IO(Files.createTempFile("test-file", ".bin")))(p => IO(p.toFile.delete).void)
+      .bracket(IO(JFiles.createTempFile("test-file", ".bin")))(p => IO(p.toFile.delete).void)
       .flatMap { nioPath =>
-        Stream.eval(store.get(path, nioPath, 4096, blocker)) >> Stream.eval {
+        Stream.eval(store.get(path, nioPath, 4096)) >> Stream.eval {
           IO {
-            Files.readAllBytes(nioPath) mustBe bytes
+            JFiles.readAllBytes(nioPath) mustBe bytes
           }
         }
       }
@@ -86,7 +81,7 @@ class StoreOpsTest extends AnyFlatSpec with Matchers with TestInstances {
   }
 }
 
-final case class DummyStore()(implicit cs: ContextShift[IO]) extends Store[IO, Authority.Bucket, String] {
+final case class DummyStore() extends Store[IO, Authority.Bucket, String] {
   val buf = new ArrayBuffer[Byte]()
   override def put(url: Url[Bucket], overwrite: Boolean, size: Option[Long] = None): Pipe[IO, Byte, Unit] = {
     in =>
@@ -109,7 +104,7 @@ final case class DummyStore()(implicit cs: ContextShift[IO]) extends Store[IO, A
 }
 
 object DummyStore {
-  def withContents(s: String)(implicit cs: ContextShift[IO]): DummyStore = {
+  def withContents(s: String): DummyStore = {
     val store = DummyStore()
     store.buf.appendAll(s.getBytes(StandardCharsets.UTF_8))
     store
