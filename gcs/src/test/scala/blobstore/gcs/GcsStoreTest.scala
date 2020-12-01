@@ -5,6 +5,7 @@ import blobstore.url.{Path, Url}
 import blobstore.url.Authority.Bucket
 import blobstore.url.Path.Plain
 import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import com.google.cloud.storage.{BlobInfo, StorageClass}
 import com.google.cloud.storage.contrib.nio.testing.LocalStorageHelper
@@ -21,7 +22,6 @@ class GcsStoreTest extends AbstractStoreTest[Bucket, GcsBlob] with Inside {
 
   val gcsStore: GcsStore[IO] = GcsStore[IO](
     LocalStorageHelper.getOptions.getService,
-    blocker,
     defaultTrailingSlashFiles = true,
     defaultDirectDownload = false
   )
@@ -100,7 +100,7 @@ class GcsStoreTest extends AbstractStoreTest[Bucket, GcsBlob] with Inside {
     val path             = writeFile(store, dir.path)(filename)
 
     val content = gcsStore
-      .getUnderlying(path, 4096, direct = true, maxChunksInFlight = None)
+      .getUnderlying(path, 4096, direct = true)
       .through(fs2.text.utf8Decode)
       .compile
       .toList

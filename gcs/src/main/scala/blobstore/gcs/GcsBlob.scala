@@ -2,8 +2,8 @@ package blobstore.gcs
 
 import java.time.Instant
 
-import blobstore.url.{FsObject}
-import blobstore.url.general.{GeneralStorageClass}
+import blobstore.url.FsObject
+import blobstore.url.general.GeneralStorageClass
 import com.google.cloud.storage.{BlobInfo, StorageClass}
 
 // This type exists only to put the FileSystemObject instance on the default implicit search path
