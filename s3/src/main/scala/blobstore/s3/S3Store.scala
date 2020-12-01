@@ -17,19 +17,18 @@ package blobstore
 package s3
 
 import java.nio.ByteBuffer
-import java.util.concurrent.CompletableFuture
-
+import java.util.concurrent.{CompletableFuture, CompletionException}
 import blobstore.url.{Authority, Path, Url}
 import blobstore.Store.{BlobStore, DelegatingStore}
-import cats.effect.{ConcurrentEffect, ContextShift, ExitCase, Resource, Sync}
+import cats.effect.{Async, Resource, Sync}
 import cats.syntax.all._
 import cats.MonadError
-import fs2.{Chunk, Hotswap, Pipe, Pull, Stream}
+import cats.effect.std.{Hotswap, Queue}
+import fs2.{Chunk, Pipe, Pull, Stream}
 import fs2.interop.reactivestreams._
 import software.amazon.awssdk.core.async.{AsyncRequestBody, AsyncResponseTransformer, SdkPublisher}
 import software.amazon.awssdk.services.s3.S3AsyncClient
 import software.amazon.awssdk.services.s3.model._
-import util.liftJavaFuture
 
 import scala.jdk.CollectionConverters._
 
@@ -54,7 +53,7 @@ class S3Store[F[_]](
   defaultTrailingSlashFiles: Boolean = false,
   bufferSize: Int = S3Store.multiUploadDefaultPartSize.toInt,
   queueSize: Int = 32
-)(implicit F: ConcurrentEffect[F], cs: ContextShift[F])
+)(implicit F: Async[F])
   extends BlobStore[F, S3Blob] {
   require(
     bufferSize >= S3Store.multiUploadMinimumPartSize,
@@ -86,7 +85,7 @@ class S3Store[F[_]](
           ()
         }
       }
-    Stream.eval(liftJavaFuture(F.delay(s3.getObject[Stream[F, Byte]](request, transformer)))).flatten
+    Stream.eval(Async[F].fromCompletableFuture(F.delay(s3.getObject[Stream[F, Byte]](request, transformer)))).flatten
   }
 
   def put(url: Url[Authority.Bucket], overwrite: Boolean = true, size: Option[Long] = None): Pipe[F, Byte, Unit] =
@@ -104,10 +103,16 @@ class S3Store[F[_]](
 
       val checkOverwrite =
         if (!overwrite) {
-          liftJavaFuture(F.delay(s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build()))).attempt
+          Async[F].fromCompletableFuture(
+            F.delay(s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build()))
+          ).attempt
             .flatMap {
-              case Left(_: NoSuchKeyException) => F.unit
-              case Left(e)                     => F.raiseError[Unit](e)
+              case Left(e: CompletionException) =>
+                Option(e.getCause) match {
+                  case Some(_: NoSuchKeyException) => F.unit
+                  case _                           => Option(e.getCause).getOrElse(e).raiseError[F, Unit]
+                }
+              case Left(e) => F.raiseError[Unit](e)
               case Right(_) =>
                 F.raiseError[Unit](new IllegalArgumentException(s"File at path '$url' already exist."))
             }
@@ -141,7 +146,7 @@ class S3Store[F[_]](
         .destinationKey(dstKey)
         .build()
     }
-    liftJavaFuture(F.delay(s3.copyObject(request))).void
+    Async[F].fromCompletableFuture(F.delay(s3.copyObject(request))).void
   }
 
   override def remove(url: Url[Authority.Bucket], recursive: Boolean = false): F[Unit] = {
@@ -150,7 +155,7 @@ class S3Store[F[_]](
     val req    = DeleteObjectRequest.builder().bucket(bucket).key(key).build()
 
     if (recursive) new StoreOps[F, Authority.Bucket, S3Blob](this).removeAll(url).void
-    else liftJavaFuture(F.delay(s3.deleteObject(req))).void
+    else Async[F].fromCompletableFuture(F.delay(s3.deleteObject(req))).void
   }
 
   override def putRotate(computePath: F[Url[Authority.Bucket]], limit: Long): Pipe[F, Byte, Unit] =
@@ -159,14 +164,14 @@ class S3Store[F[_]](
         .flatMap(chunk => Stream.eval(computePath).flatMap(path => Stream.chunk(chunk).through(put(path))))
     } else {
       val newFile = for {
-        path  <- Resource.liftF(computePath)
-        queue <- Resource.liftF(fs2.concurrent.Queue.bounded[F, Option[Chunk[Byte]]](queueSize))
+        path  <- Resource.eval(computePath)
+        queue <- Resource.eval(Queue.bounded[F, Option[Chunk[Byte]]](queueSize))
         _ <- Resource.make(
-          F.start(queue.dequeue.unNoneTerminate.flatMap(Stream.chunk).through(put(path)).compile.drain)
-        )(_.join)
-        _ <- Resource.make(F.unit)(_ => queue.enqueue1(None))
+          F.start(Stream.repeatEval(queue.take).unNoneTerminate.flatMap(Stream.chunk).through(put(path)).compile.drain)
+        )(_.join.void)
+        _ <- Resource.make(F.unit)(_ => queue.offer(None))
       } yield queue
-      putRotateBase(limit, newFile)(queue => chunk => queue.enqueue1(Some(chunk)))
+      putRotateBase(limit, newFile)(queue => chunk => queue.offer(Some(chunk)))
     }
 
   def listUnderlying(
@@ -189,7 +194,7 @@ class S3Store[F[_]](
       val fDirs =
         ol.commonPrefixes().asScala.toList.flatMap(cp => Option(cp.prefix())).traverse[F, Path[S3Blob]] { prefix =>
           if (expectTrailingSlashFiles) {
-            liftJavaFuture(
+            Async[F].fromCompletableFuture(
               F.delay(s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(prefix).build()))
             ).map { resp =>
               Path(prefix).as(S3Blob(bucket, prefix, new S3MetaInfo.HeadObjectResponseMetaInfo(resp).some))
@@ -205,7 +210,7 @@ class S3Store[F[_]](
 
       val fFiles = ol.contents().asScala.toList.traverse[F, Path[S3Blob]] { s3Object =>
         if (fullMetadata) {
-          liftJavaFuture(
+          Async[F].fromCompletableFuture(
             F.delay(s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(s3Object.key()).build()))
           ).map { resp =>
             Path(s3Object.key()).as(S3Blob(
@@ -230,13 +235,12 @@ class S3Store[F[_]](
     meta: Option[S3MetaInfo],
     size: Long,
     in: Stream[F, Byte]
-  ): Stream[F, Unit] = {
-    val request = S3Store.putObjectRequest(sseAlgorithm, objectAcl)(bucket, key, meta, size)
-
-    val requestBody = AsyncRequestBody.fromPublisher(in.chunks.map(chunk => chunk.toByteBuffer).toUnicastPublisher)
-
-    Stream.eval(liftJavaFuture(F.delay(s3.putObject(request, requestBody))).void)
-  }
+  ): Stream[F, Unit] =
+    Stream.resource(in.chunks.map(chunk => chunk.toByteBuffer).toUnicastPublisher).flatMap { publisher =>
+      val request     = S3Store.putObjectRequest(sseAlgorithm, objectAcl)(bucket, key, meta, size)
+      val requestBody = AsyncRequestBody.fromPublisher(publisher)
+      Stream.eval(Async[F].fromCompletableFuture(F.delay(s3.putObject(request, requestBody))).void)
+    }
 
   private def putUnknownSize(
     bucket: String,
@@ -251,7 +255,7 @@ class S3Store[F[_]](
         case Some((chunk, _)) if chunk.size < bufferSize =>
           val request     = S3Store.putObjectRequest(sseAlgorithm, objectAcl)(bucket, key, meta, chunk.size.toLong)
           val requestBody = AsyncRequestBody.fromByteBuffer(chunk.toByteBuffer)
-          Pull.eval(liftJavaFuture(F.delay(s3.putObject(request, requestBody))).void)
+          Pull.eval(Async[F].fromCompletableFuture(F.delay(s3.putObject(request, requestBody))).void)
         case Some((chunk, rest)) =>
           val request: CreateMultipartUploadRequest = {
             val builder = CreateMultipartUploadRequest.builder()
@@ -265,7 +269,7 @@ class S3Store[F[_]](
           }
 
           val makeRequest: F[CreateMultipartUploadResponse] =
-            liftJavaFuture(F.delay(s3.createMultipartUpload(request)))
+            Async[F].fromCompletableFuture(F.delay(s3.createMultipartUpload(request)))
 
           Pull.eval(makeRequest).flatMap { muResp =>
             val abortReq: AbortMultipartUploadRequest =
@@ -293,16 +297,16 @@ class S3Store[F[_]](
                   val fBody    = F.delay(AsyncRequestBody.fromPublisher(CompletableFuturePublisher.from(cf)))
                   val done = for {
                     body <- fBody
-                    resp <- liftJavaFuture(F.delay(s3.uploadPart(req, body)))
+                    resp <- Async[F].fromCompletableFuture(F.delay(s3.uploadPart(req, body)))
                     _    <- F.delay(byteBuffer.clear())
                   } yield CompletedPart.builder().eTag(resp.eTag()).partNumber(part).build()
                   F.delay((cf, done))
                 } {
-                  case ((cf, _), ExitCase.Completed) =>
+                  case ((cf, _), Resource.ExitCase.Succeeded) =>
                     F.delay { byteBuffer.flip(); cf.complete(byteBuffer) }.void
-                  case ((cf, _), ExitCase.Error(e)) =>
+                  case ((cf, _), Resource.ExitCase.Errored(e)) =>
                     F.delay(cf.completeExceptionally(e)).void
-                  case ((cf, _), ExitCase.Canceled) =>
+                  case ((cf, _), Resource.ExitCase.Canceled) =>
                     F.delay(cf.cancel(true)).void
                 }
                 .map(_._2)
@@ -333,19 +337,19 @@ class S3Store[F[_]](
                         completeReqBuilder
                           .multipartUpload(CompletedMultipartUpload.builder().parts(parts.asJava).build())
                           .build()
-                      Pull.eval(liftJavaFuture(F.delay(s3.completeMultipartUpload(request)))).void
+                      Pull.eval(Async[F].fromCompletableFuture(F.delay(s3.completeMultipartUpload(request)))).void
                     }
               }
               .onError {
                 case _ =>
-                  Pull.eval(liftJavaFuture(F.delay(s3.abortMultipartUpload(abortReq)))).void
+                  Pull.eval(Async[F].fromCompletableFuture(F.delay(s3.abortMultipartUpload(abortReq)))).void
               }
           }
       }
       .stream
 
   override def stat(url: Url[Authority.Bucket]): Stream[F, Path[S3Blob]] =
-    Stream.eval(liftJavaFuture(
+    Stream.eval(Async[F].fromCompletableFuture(
       F.delay(s3.headObject(HeadObjectRequest.builder().bucket(url.bucket.show).key(url.path.relative.show).build()))
     ).map { resp =>
       Path.of(
@@ -353,12 +357,16 @@ class S3Store[F[_]](
         S3Blob(url.bucket.show, url.path.relative.show, new S3MetaInfo.HeadObjectResponseMetaInfo(resp).some)
       ).some
     }
-      .recover {
-        case _: NoSuchKeyException =>
-          val meta = (!url.path.show.endsWith("/")).guard[Option].as(S3MetaInfo.const()).filterNot(_ =>
-            defaultTrailingSlashFiles
-          )
-          Path.of(url.path.show, S3Blob(url.bucket.show, url.path.relative.show, meta)).some
+      .recoverWith {
+        case e: CompletionException =>
+          Option(e.getCause) match {
+            case Some(_: NoSuchKeyException) =>
+              val meta = (!url.path.show.endsWith("/")).guard[Option].as(S3MetaInfo.const()).filterNot(_ =>
+                defaultTrailingSlashFiles
+              )
+              Path.of(url.path.show, S3Blob(url.bucket.show, url.path.relative.show, meta)).some.pure
+            case _ => Option(e.getCause).getOrElse(e).raiseError
+          }
       }).unNone
 
   override def widen(implicit ME: MonadError[F, Throwable]): Store[F, Authority.Standard, S3Blob] =
@@ -366,7 +374,7 @@ class S3Store[F[_]](
 }
 
 object S3Store {
-  def apply[F[_]](
+  def apply[F[_]: Async](
     s3: S3AsyncClient,
     objectAcl: Option[ObjectCannedACL] = None,
     sseAlgorithm: Option[String] = None,
@@ -374,19 +382,21 @@ object S3Store {
     defaultTrailingSlashFiles: Boolean = false,
     bufferSize: Int = S3Store.multiUploadDefaultPartSize.toInt,
     queueSize: Int = 32
-  )(implicit F: ConcurrentEffect[F], cs: ContextShift[F]): F[S3Store[F]] =
-    if (bufferSize < S3Store.multiUploadMinimumPartSize) {
+  ): F[S3Store[F]] =
+    if (bufferSize < S3Store.multiUploadMinimumPartSize)
       new IllegalArgumentException(s"Buffer size must be at least ${S3Store.multiUploadMinimumPartSize}").raiseError
-    } else
-      new S3Store(
-        s3,
-        objectAcl,
-        sseAlgorithm,
-        defaultFullMetadata,
-        defaultTrailingSlashFiles,
-        bufferSize,
-        queueSize
-      ).pure[F]
+    else
+      Async[F].catchNonFatal {
+        new S3Store(
+          s3,
+          objectAcl,
+          sseAlgorithm,
+          defaultFullMetadata,
+          defaultTrailingSlashFiles,
+          bufferSize,
+          queueSize
+        )
+      }
 
   private def putObjectRequest(
     sseAlgorithm: Option[String],

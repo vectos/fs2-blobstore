@@ -8,6 +8,7 @@ import software.amazon.awssdk.auth.credentials.{AwsBasicCredentials, StaticCrede
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3AsyncClient
 import software.amazon.awssdk.services.s3.model.StorageClass
+import cats.effect.unsafe.implicits.global
 
 import java.net.URI
 
@@ -62,7 +63,7 @@ class S3StoreMinioTest extends AbstractS3StoreTest {
     val filePath = Path(s"test-$testRun/set-underlying/file2")
     Stream
       .random[IO]
-      .flatMap(n => Stream.chunk(Chunk.bytes(n.toString.getBytes())))
+      .flatMap(n => Stream.chunk(Chunk.ArraySlice(n.toString.getBytes())))
       .take(6 * 1024 * 1024)
       .through(s3Store.put(authority.s3 / filePath, overwrite = true, size = None, meta = Some(s3Meta)))
       .compile

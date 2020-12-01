@@ -4,7 +4,8 @@ import blobstore.AbstractStoreTest
 import blobstore.url.Authority.Bucket
 import blobstore.url.{Authority, Path}
 import cats.effect.IO
-import cats.effect.concurrent.Ref
+import cats.effect.Ref
+import cats.effect.unsafe.implicits.global
 import cats.syntax.all._
 import com.dimafeng.testcontainers.GenericContainer
 import fs2.{Chunk, Stream}
@@ -58,13 +59,13 @@ abstract class AbstractS3StoreTest extends AbstractStoreTest[Authority.Bucket, S
     for {
       bytes <- Stream
         .random[IO]
-        .flatMap(n => Stream.chunk(Chunk.bytes(n.toString.getBytes())))
+        .flatMap(n => Stream.chunk(Chunk.ArraySlice(n.toString.getBytes())))
         .take(size)
         .compile
         .to(Array)
       path = Path(s"$authority/test-$testRun/multipart-upload/") / name
       url  = authority.s3 / path
-      _         <- Stream.chunk(Chunk.bytes(bytes)).through(store.put(url, size = None)).compile.drain
+      _         <- Stream.chunk(Chunk.ArraySlice(bytes)).through(store.put(url, size = None)).compile.drain
       readBytes <- store.get(url, 4096).compile.to(Array)
       _         <- store.remove(url)
     } yield readBytes mustBe bytes

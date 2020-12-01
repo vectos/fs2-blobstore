@@ -17,6 +17,7 @@ package blobstore
 package s3
 
 import java.net.URI
+import cats.effect.unsafe.implicits.global
 import com.dimafeng.testcontainers.GenericContainer
 import software.amazon.awssdk.auth.credentials.{AwsBasicCredentials, StaticCredentialsProvider}
 import software.amazon.awssdk.regions.Region
