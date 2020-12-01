@@ -6,6 +6,7 @@ import blobstore.url.Authority.Bucket
 import blobstore.url.Path.Plain
 import blobstore.url.{Path, Url}
 import cats.effect.IO
+import cats.effect.unsafe.implicits.global
 import fs2.Stream
 import com.azure.storage.blob.{BlobServiceAsyncClient, BlobServiceClientBuilder}
 import com.azure.storage.blob.models.{AccessTier, BlobItemProperties, BlobType}
