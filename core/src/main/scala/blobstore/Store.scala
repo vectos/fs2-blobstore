@@ -15,20 +15,17 @@ Copyright 2018 LendUp Global, Inc.
  */
 package blobstore
 
-import java.nio.charset.StandardCharsets
-
-import blobstore.url.{Authority, Path, Url}
-import blobstore.url.Authority.Bucket
-import blobstore.url.exception.MultipleUrlValidationException
+import blobstore.url.{Path, Url}
 import cats.{ApplicativeError, MonadError}
 import cats.data.Validated
 import cats.effect.{ContextShift, Sync}
 import cats.syntax.all._
 import fs2.{Pipe, Stream}
 
+import java.nio.charset.StandardCharsets
 import scala.util.{Failure, Success, Try}
 
-trait Store[F[_], A <: Authority, +BlobType] {
+trait Store[F[_], +BlobType] {
 
   /** @param url to list
     * @param recursive when true returned list would contain files at given path and all sub-folders but no folders,
@@ -45,13 +42,13 @@ trait Store[F[_], A <: Authority, +BlobType] {
     *          list(folder, recursive = true)  -> [a, b, c, d, e]
     *          list(folder, recursive = false) -> [a, b, c, sub-folder]
     */
-  def list(url: Url[A], recursive: Boolean = false): Stream[F, Path[BlobType]]
+  def list(url: Url, recursive: Boolean = false): Stream[F, Path[BlobType]]
 
   /** @param url to get
     * @param chunkSize bytes to read in each chunk.
     * @return stream of bytes
     */
-  def get(url: Url[A], chunkSize: Int): Stream[F, Byte]
+  def get(url: Url, chunkSize: Int): Stream[F, Byte]
 
   /** It is highly recommended to provide `Path.size` when writing as it allows for optimizations in some store.
     * Specifically, S3Store will behave very poorly if no size is provided as it will load all bytes in memory before
@@ -61,9 +58,9 @@ trait Store[F[_], A <: Authority, +BlobType] {
     * @param overwrite when true putting to path with pre-existing file would overwrite the content, otherwise – fail with error.
     * @return sink of bytes
     */
-  def put(url: Url[A], overwrite: Boolean = true, size: Option[Long] = None): Pipe[F, Byte, Unit]
+  def put(url: Url, overwrite: Boolean = true, size: Option[Long] = None): Pipe[F, Byte, Unit]
 
-  def put(contents: String, url: Url[A]): Stream[F, Unit] = {
+  def put(contents: String, url: Url): Stream[F, Unit] = {
     val bytes = contents.getBytes(StandardCharsets.UTF_8)
     Stream
       .emits(bytes)
@@ -76,20 +73,20 @@ trait Store[F[_], A <: Authority, +BlobType] {
     * @param dst path
     * @return F[Unit]
     */
-  def move(src: Url[A], dst: Url[A]): F[Unit]
+  def move(src: Url, dst: Url): F[Unit]
 
   /** Copies bytes from srcPath to dstPath. Stores should optimize to use native copy functions to avoid data transfer.
     * @param src path
     * @param dst path
     * @return F[Unit]
     */
-  def copy(src: Url[A], dst: Url[A]): F[Unit]
+  def copy(src: Url, dst: Url): F[Unit]
 
   /** Remove bytes for given path. Call should succeed even if there is nothing stored at that path.
     * @param url to remove
     * @return F[Unit]
     */
-  def remove(url: Url[A], recursive: Boolean = false): F[Unit]
+  def remove(url: Url, recursive: Boolean = false): F[Unit]
 
   /** Writes all data to a sequence of blobs/files, each limited in size to `limit`.
     *
@@ -105,22 +102,22 @@ trait Store[F[_], A <: Authority, +BlobType] {
     * @param limit maximum size in bytes for each file.
     * @return sink of bytes
     */
-  def putRotate(computePath: F[Url[A]], limit: Long): Pipe[F, Byte, Unit]
+  def putRotate(computePath: F[Url], limit: Long): Pipe[F, Byte, Unit]
 
-  def widen(implicit ME: MonadError[F, Throwable]): Store[F, Authority.Standard, BlobType]
+  def widen(implicit ME: MonadError[F, Throwable]): Store[F, BlobType]
 
-  def stat(url: Url[A]): Stream[F, Path[BlobType]]
+  def stat(url: Url): Stream[F, Path[BlobType]]
 }
 
 object Store {
-  implicit def syntax[F[_]: Sync: ContextShift, A <: Authority, B](store: Store[F, A, B]): StoreOps[F, A, B] =
-    new StoreOps[F, A, B](store)
+  implicit def syntax[F[_]: Sync: ContextShift, B](store: Store[F, B]): StoreOps[F, B] =
+    new StoreOps[F, B](store)
 
   /** Blobstores operates on buckets and returns store specific blob types
     *
     * For example, S3 is a BlobStore[F, S3MetaInfo]
     */
-  type BlobStore[F[_], B] = Store[F, Authority.Bucket, B]
+  type BlobStore[F[_], B] = Store[F, B]
 
   /** Validates input URLs before delegating to underlying store. This allows different stores to be exposed
     * under a the same, and wider, interface. For instance, we can expose FileStore's with Path input as a
@@ -129,24 +126,24 @@ object Store {
     * Use `transformPath` to control how paths retrieved from input URLs are converted to paths for FileStores
     */
   //
-  private[blobstore] class DelegatingStore[F[_]: MonadError[*[_], Throwable], AA <: Authority, Blob](
+  private[blobstore] class DelegatingStore[F[_]: MonadError[*[_], Throwable], Blob](
     underlying: Either[BlobStore[F, Blob], PathStore[F, Blob]],
-    pathStoreValidate: Url[AA] => Validated[Throwable, Path.Plain] = (_: Url[AA]).path.valid[Throwable]
-  ) extends Store[F, AA, Blob] {
+    pathStoreValidate: Url => Validated[Throwable, Path.Plain] = (_: Url).path.valid[Throwable]
+  ) extends Store[F, Blob] {
 
-    override def list(url: Url[AA], recursive: Boolean): Stream[F, Path[Blob]] =
+    override def list(url: Url, recursive: Boolean): Stream[F, Path[Blob]] =
       validateAndInvoke[Stream[F, *], Path[Blob]](url)(
         _.list(_, recursive),
         _.list(_, recursive)
       )
 
-    override def get(url: Url[AA], chunkSize: Int): Stream[F, Byte] =
+    override def get(url: Url, chunkSize: Int): Stream[F, Byte] =
       validateAndInvoke[Stream[F, *], Byte](url)(
         _.get(_, chunkSize),
         _.get(_, chunkSize)
       )
 
-    override def put(url: Url[AA], overwrite: Boolean = true, size: Option[Long] = None): Pipe[F, Byte, Unit] =
+    override def put(url: Url, overwrite: Boolean = true, size: Option[Long] = None): Pipe[F, Byte, Unit] =
       s => {
         val t = validateAndInvoke[Try, Pipe[F, Byte, Unit]](url)(
           _.put(_, overwrite, size).pure[Try],
@@ -159,7 +156,7 @@ object Store {
         }
       }
 
-    override def move(src: Url[AA], dst: Url[AA]): F[Unit] =
+    override def move(src: Url, dst: Url): F[Unit] =
       underlying match {
         case Left(blobstore) =>
           (validateForBlobStore[F](src), validateForBlobStore[F](dst)).tupled.flatMap {
@@ -171,7 +168,7 @@ object Store {
           }
       }
 
-    override def copy(src: Url[AA], dst: Url[AA]): F[Unit] =
+    override def copy(src: Url, dst: Url): F[Unit] =
       underlying match {
         case Left(blobstore) =>
           (validateForBlobStore[F](src), validateForBlobStore[F](dst)).tupled.flatMap {
@@ -183,19 +180,19 @@ object Store {
           }
       }
 
-    override def remove(url: Url[AA], recursive: Boolean): F[Unit] =
+    override def remove(url: Url, recursive: Boolean): F[Unit] =
       validateAndInvoke[F, Unit](url)(
         _.remove(_, recursive),
         _.remove(_, recursive)
       )
 
-    override def stat(url: Url[AA]): Stream[F, Path[Blob]] =
+    override def stat(url: Url): Stream[F, Path[Blob]] =
       validateAndInvoke[Stream[F, *], Path[Blob]](url)(
         _.stat(_),
         (a, b) => Stream.eval(a.stat(b)).unNone
       )
 
-    override def putRotate(computePath: F[Url[AA]], limit: Long): Pipe[F, Byte, Unit] =
+    override def putRotate(computePath: F[Url], limit: Long): Pipe[F, Byte, Unit] =
       underlying match {
         case Left(blobStore) =>
           val u = computePath.flatMap(u => validateForBlobStore[F](u))
@@ -205,16 +202,17 @@ object Store {
           fileStore.putRotate(u, limit)
       }
 
-    private def validateForBlobStore[G[_]: ApplicativeError[*[_], Throwable]](url: Url[AA]): G[Url[Bucket]] =
-      Url.bucket(url.show).leftMap(MultipleUrlValidationException.apply).liftTo[G]
+    private def validateForBlobStore[G[_]: ApplicativeError[*[_], Throwable]](url: Url): G[Url] =
+      ???
+    //      Url.bucket(url.show).leftMap(MultipleUrlValidationException.apply).liftTo[G]
 
     private def validateForFileStore[G[_]: ApplicativeError[*[_], Throwable]](
-      url: Url[AA]
+      url: Url
     ): G[Path.Plain] =
       pathStoreValidate(url).liftTo[G]
 
-    private def validateAndInvoke[G[_]: MonadError[*[_], Throwable], A](url: Url[AA])(
-      f: (BlobStore[F, Blob], Url[Bucket]) => G[A],
+    private def validateAndInvoke[G[_]: MonadError[*[_], Throwable], A](url: Url)(
+      f: (BlobStore[F, Blob], Url) => G[A],
       g: (PathStore[F, Blob], Path.Plain) => G[A]
     ): G[A] =
       underlying match {
@@ -222,10 +220,10 @@ object Store {
         case Right(fileStore) => validateForFileStore[G](url).flatMap(g(fileStore, _))
       }
 
-    override def widen(implicit ME: MonadError[F, Throwable]): Store[F, Authority.Standard, Blob] = {
+    override def widen(implicit ME: MonadError[F, Throwable]): Store[F, Blob] = {
       underlying match {
         case Left(blobStore)  => blobStore.widen(ME)
-        case Right(pathStore) => pathStore.liftToStandard
+        case Right(pathStore) => pathStore.liftTo
       }
     }
   }
